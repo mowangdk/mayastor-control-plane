@@ -5,6 +5,7 @@ use nvmeadm::{
 use std::{
     collections::HashMap,
     convert::{From, TryFrom},
+    os::unix::fs::MetadataExt,
     path::Path,
     str::FromStr,
 };
@@ -26,6 +27,11 @@ use udev::{Device, Enumerator};
 use url::Url;
 use uuid::Uuid;
 
+// Keep concurrent CSI requests from saturating the blocking pool with full
+// device scans as volume count grows.
+static DEVICE_SCAN: once_cell::sync::Lazy<std::sync::Arc<tokio::sync::Semaphore>> =
+    once_cell::sync::Lazy::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+
 lazy_static::lazy_static! {
     static ref DEVICE_REGEX: Regex = Regex::new(r"nvme(\d{1,5})n(\d{1,5})").unwrap();
 }
@@ -42,7 +48,7 @@ pub(super) struct NvmfAttach {
     reconnect_delay: Option<u32>,
     keep_alive_tmo: Option<u32>,
     hostnqn: Option<String>,
-    warn_bad: std::sync::atomic::AtomicBool,
+    warn_bad: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl NvmfAttach {
@@ -72,22 +78,39 @@ impl NvmfAttach {
             reconnect_delay,
             keep_alive_tmo,
             hostnqn,
-            warn_bad: std::sync::atomic::AtomicBool::new(true),
+            warn_bad: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
-    fn get_device(&self) -> Result<Option<Device>, DeviceError> {
-        let key: String = format!("uuid.{}", self.uuid);
-        let mut enumerator = Enumerator::new()?;
+    fn get_device(
+        uuid: &Uuid,
+        warn_bad: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<Device>, DeviceError> {
+        let key: String = format!("uuid.{uuid}");
+        let multipath = utils::check_nvme_core_ana()?;
 
+        // Avoid enumerating every block device when udev has already indexed this
+        // namespace. Still validate its identity, model and live controller.
+        if let Ok(device) = std::fs::metadata(format!("/dev/disk/by-id/nvme-{key}"))
+            .and_then(|metadata| Device::from_devnum(udev::DeviceType::Block, metadata.rdev()))
+        {
+            if matches!(
+                match_device(&device, &key, Some(multipath), warn_bad),
+                Ok(Some(_))
+            ) {
+                return Ok(Some(device));
+            }
+        }
+
+        // The index can be absent or stale while udev processes device events.
+        // Preserve the existing scan and error handling in that case.
+        let mut enumerator = Enumerator::new()?;
         enumerator.match_subsystem("block")?;
         enumerator.match_property("DEVTYPE", "disk")?;
 
-        let multipath = utils::check_nvme_core_ana()?;
-
         let mut first_error = Ok(None);
         for device in enumerator.scan_devices()? {
-            match match_device(&device, &key, Some(multipath), &self.warn_bad) {
+            match match_device(&device, &key, Some(multipath), warn_bad) {
                 Ok(name) if name.is_some() => {
                     return Ok(Some(device));
                 }
@@ -234,12 +257,22 @@ impl Attach for NvmfAttach {
     }
 
     async fn find(&self) -> Result<Option<DeviceName>, DeviceError> {
-        self.get_device().map(|device_maybe| match device_maybe {
-            Some(device) => device
-                .property_value("DEVNAME")
-                .map(|path| path.to_str().unwrap().into()),
-            None => None,
+        let uuid = self.uuid;
+        let warn_bad = self.warn_bad.clone();
+        let permit = DEVICE_SCAN.clone().acquire_owned().await.unwrap();
+        // Keep udev objects on the blocking thread; only return the owned name.
+        runtime::spawn_blocking(move || {
+            let _permit = permit;
+            Self::get_device(&uuid, &warn_bad).map(|device| {
+                device.and_then(|device| {
+                    device
+                        .property_value("DEVNAME")
+                        .map(|path| path.to_str().unwrap().into())
+                })
+            })
         })
+        .await
+        .map_err(|error| DeviceError::new(error.to_string()))?
     }
 
     async fn fixup(&self) -> Result<(), DeviceError> {
@@ -247,8 +280,7 @@ impl Attach for NvmfAttach {
             return Ok(());
         };
 
-        let device = self
-            .get_device()?
+        let device = Self::get_device(&self.uuid, &self.warn_bad)?
             .ok_or_else(|| DeviceError::new("NVMe device not found"))?;
 
         let pattern = block_dev_q(&device, None)?;

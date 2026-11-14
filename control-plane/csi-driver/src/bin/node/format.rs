@@ -14,7 +14,7 @@ pub(crate) async fn prepare_device(
     format_options: &str,
 ) -> Result<(), String> {
     debug!("Probing device {}", device);
-    let fs = FileSystem::property(device, "TYPE");
+    let fs = FileSystem::property(device, "TYPE").await;
 
     let fs_ops = fstype.fs_ops()?;
 
