@@ -81,10 +81,18 @@ impl FileSystem {
         }
     }
     /// Get a specific filesystem property by specifying the device path.
-    pub(crate) fn property(device: &str, property: &str) -> Result<String, DevInfoError> {
-        let probe = Probe::new_from_filename(device)?;
-        probe.do_probe()?;
-        probe.lookup_value(property)
+    pub(crate) async fn property(device: &str, property: &str) -> Result<String, DevInfoError> {
+        let device = device.to_owned();
+        let property = property.to_owned();
+        // blkid can wait for block I/O; do not stall the CSI async runtime.
+        crate::runtime::spawn_blocking(move || {
+            let probe = Probe::new_from_filename(&device)?;
+            probe.do_probe()?;
+            probe.lookup_value(&property)
+        })
+        .await
+        // A worker failure must not be interpreted as an unformatted device.
+        .expect("filesystem probe task failed")
     }
 }
 
@@ -198,7 +206,7 @@ impl FileSystemOps for Ext4Fs {
     }
 
     async fn set_uuid(&self, device: &str, volume_uuid: &Uuid) -> Result<(), Error> {
-        if let Ok(probed_uuid) = FileSystem::property(device, "UUID") {
+        if let Ok(probed_uuid) = FileSystem::property(device, "UUID").await {
             if probed_uuid == volume_uuid.to_string() {
                 return Ok(());
             }
@@ -222,6 +230,7 @@ impl FileSystemOps for Ext4Fs {
         }
 
         let probe_uuid = FileSystem::property(device, "UUID")
+            .await
             .map_err(|error| format!("Failed to get UUID of device {device}: {error}"))?;
 
         if volume_uuid.to_string() != probe_uuid {
@@ -310,7 +319,7 @@ impl FileSystemOps for XFs {
     }
 
     async fn set_uuid(&self, device: &str, volume_uuid: &Uuid) -> Result<(), Error> {
-        if let Ok(probed_uuid) = FileSystem::property(device, "UUID") {
+        if let Ok(probed_uuid) = FileSystem::property(device, "UUID").await {
             if probed_uuid == volume_uuid.to_string() {
                 return Ok(());
             }
@@ -334,6 +343,7 @@ impl FileSystemOps for XFs {
         }
 
         let probe_uuid = FileSystem::property(device, "UUID")
+            .await
             .map_err(|error| format!("Failed to get UUID of device {device}: {error}"))?;
 
         if volume_uuid.to_string() != probe_uuid {
@@ -420,7 +430,7 @@ impl FileSystemOps for BtrFs {
     }
 
     async fn set_uuid(&self, device: &str, volume_uuid: &Uuid) -> Result<(), Error> {
-        if let Ok(probed_uuid) = FileSystem::property(device, "UUID") {
+        if let Ok(probed_uuid) = FileSystem::property(device, "UUID").await {
             if probed_uuid == volume_uuid.to_string() {
                 return Ok(());
             }
@@ -444,6 +454,7 @@ impl FileSystemOps for BtrFs {
         }
 
         let probe_uuid = FileSystem::property(device, "UUID")
+            .await
             .map_err(|error| format!("Failed to get UUID of device {device}: {error}"))?;
 
         if volume_uuid.to_string() != probe_uuid {

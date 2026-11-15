@@ -415,7 +415,7 @@ pub(crate) async fn unmount_on_fs_id_diff(
     fs_staging_path: &str,
     volume_uuid: &Uuid,
 ) -> Result<(), String> {
-    if let Ok(probed_uuid) = FileSystem::property(device_path, "UUID") {
+    if let Ok(probed_uuid) = FileSystem::property(device_path, "UUID").await {
         if probed_uuid == volume_uuid.to_string() {
             return Ok(());
         }
