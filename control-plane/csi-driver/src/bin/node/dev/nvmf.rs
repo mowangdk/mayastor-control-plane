@@ -26,6 +26,11 @@ use udev::{Device, Enumerator};
 use url::Url;
 use uuid::Uuid;
 
+// Keep concurrent CSI requests from saturating the blocking pool with full
+// device scans as volume count grows.
+static DEVICE_SCAN: once_cell::sync::Lazy<std::sync::Arc<tokio::sync::Semaphore>> =
+    once_cell::sync::Lazy::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+
 lazy_static::lazy_static! {
     static ref DEVICE_REGEX: Regex = Regex::new(r"nvme(\d{1,5})n(\d{1,5})").unwrap();
 }
@@ -239,8 +244,10 @@ impl Attach for NvmfAttach {
     async fn find(&self) -> Result<Option<DeviceName>, DeviceError> {
         let uuid = self.uuid;
         let warn_bad = self.warn_bad.clone();
+        let permit = DEVICE_SCAN.clone().acquire_owned().await.unwrap();
         // Keep udev objects on the blocking thread; only return the owned name.
         runtime::spawn_blocking(move || {
+            let _permit = permit;
             Self::get_device(&uuid, &warn_bad).map(|device| {
                 device.and_then(|device| {
                     device
