@@ -5,6 +5,7 @@ use nvmeadm::{
 use std::{
     collections::HashMap,
     convert::{From, TryFrom},
+    os::unix::fs::MetadataExt,
     path::Path,
     str::FromStr,
 };
@@ -86,12 +87,26 @@ impl NvmfAttach {
         warn_bad: &std::sync::atomic::AtomicBool,
     ) -> Result<Option<Device>, DeviceError> {
         let key: String = format!("uuid.{uuid}");
-        let mut enumerator = Enumerator::new()?;
+        let multipath = utils::check_nvme_core_ana()?;
 
+        // Avoid enumerating every block device when udev has already indexed this
+        // namespace. Still validate its identity, model and live controller.
+        if let Ok(device) = std::fs::metadata(format!("/dev/disk/by-id/nvme-{key}"))
+            .and_then(|metadata| Device::from_devnum(udev::DeviceType::Block, metadata.rdev()))
+        {
+            if matches!(
+                match_device(&device, &key, Some(multipath), warn_bad),
+                Ok(Some(_))
+            ) {
+                return Ok(Some(device));
+            }
+        }
+
+        // The index can be absent or stale while udev processes device events.
+        // Preserve the existing scan and error handling in that case.
+        let mut enumerator = Enumerator::new()?;
         enumerator.match_subsystem("block")?;
         enumerator.match_property("DEVTYPE", "disk")?;
-
-        let multipath = utils::check_nvme_core_ana()?;
 
         let mut first_error = Ok(None);
         for device in enumerator.scan_devices()? {
