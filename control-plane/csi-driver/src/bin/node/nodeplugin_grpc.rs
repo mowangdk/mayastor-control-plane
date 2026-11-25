@@ -107,7 +107,7 @@ impl NodePlugin for NodePluginSvc {
                 })?;
 
                 if let Ok(Some(device)) = Device::lookup(&uuid).await {
-                    let mountpaths = findmnt::get_mountpaths(&device.devname()).await?;
+                    let mountpaths = findmnt::get_flat_mountpaths(&device.devname()).await?;
                     debug!(
                         "Device: {} found, with mount paths: {}, issuing unmount",
                         device.devname(),

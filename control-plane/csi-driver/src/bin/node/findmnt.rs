@@ -142,12 +142,45 @@ fn filter_findmnt(
 const FIND_MNT: &str = "findmnt";
 /// findmnt arguments, we only want source, target and filesystem type fields.
 const FIND_MNT_ARGS: [&str; 3] = ["-J", "-o", "SOURCE,TARGET,FSTYPE"];
+const FLAT_FIND_MNT_ARGS: [&str; 4] = ["--list", "-J", "-o", "SOURCE,TARGET,FSTYPE"];
+
+#[test]
+fn flat_findmnt_preserves_deeply_stacked_mounts() {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+
+    let mut child = Command::new(FIND_MNT)
+        .args(FLAT_FIND_MNT_ARGS)
+        .args(["--kernel", "--tab-file", "/dev/stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    for id in 1..=127 {
+        writeln!(input, "{id} {} 0:6 / /stack rw - tmpfs tmpfs rw", id - 1).unwrap();
+    }
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let mounts: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let entries = mounts["filesystems"].as_array().unwrap();
+    assert_eq!(entries.len(), 127);
+    assert!(entries
+        .iter()
+        .all(|m| m["target"] == "/stack" && m.get("children").is_none()));
+}
 
 /// Execute the Linux utility findmnt, collect the json output,
 /// invoke the filter function and return the filtered results.
-async fn findmnt(params: Filter<'_>) -> Result<Vec<HashMap<String, String>>, DeviceError> {
+async fn findmnt(
+    params: Filter<'_>,
+    args: &[&str],
+) -> Result<Vec<HashMap<String, String>>, DeviceError> {
     let output = tokio::process::Command::new(FIND_MNT)
-        .args(FIND_MNT_ARGS)
+        .args(args)
         .output()
         .await?;
 
@@ -170,7 +203,7 @@ pub(crate) async fn get_devicepath(mount_path: &str) -> Result<Option<String>, D
         key: TARGET_KEY,
         value: mount_path,
     };
-    let sources = findmnt(tgt_filter).await?;
+    let sources = findmnt(tgt_filter, &FIND_MNT_ARGS).await?;
     {
         match sources.len() {
             0 => Ok(None),
@@ -199,11 +232,24 @@ pub(crate) async fn get_devicepath(mount_path: &str) -> Result<Option<String>, D
 /// if any.
 /// device_path is the path to the device for example "/dev/sda1"
 pub(crate) async fn get_mountpaths(device_path: &str) -> Result<Vec<DeviceMount>, DeviceError> {
+    device_mountpaths(device_path, &FIND_MNT_ARGS).await
+}
+
+pub(crate) async fn get_flat_mountpaths(
+    device_path: &str,
+) -> Result<Vec<DeviceMount>, DeviceError> {
+    device_mountpaths(device_path, &FLAT_FIND_MNT_ARGS).await
+}
+
+async fn device_mountpaths(
+    device_path: &str,
+    args: &[&str],
+) -> Result<Vec<DeviceMount>, DeviceError> {
     let dev_filter = Filter {
         key: SOURCE_KEY,
         value: device_path,
     };
-    match findmnt(dev_filter).await {
+    match findmnt(dev_filter, args).await {
         Ok(results) => {
             let mut mountpaths: Vec<DeviceMount> = Vec::new();
             for entry in results {
@@ -258,7 +304,7 @@ async fn find_csi_mount(
     path_prefix: Option<&str>,
 ) -> Result<Vec<HashMap<String, String>>, DeviceError> {
     let mut command = tokio::process::Command::new(FIND_MNT);
-    command.args(FIND_MNT_ARGS);
+    command.args(FLAT_FIND_MNT_ARGS);
 
     if let Some(path_prefix) = path_prefix {
         command.args(["-R", path_prefix]);
