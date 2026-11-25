@@ -3,7 +3,15 @@ use csi_driver::filesystem::FileSystem as Fs;
 use utils::csi_plugin_name;
 
 use serde_json::Value;
-use std::{collections::HashMap, str::FromStr, string::String, vec::Vec};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    os::unix::fs::FileTypeExt,
+    path::{Path, PathBuf},
+    str::FromStr,
+    string::String,
+    vec::Vec,
+};
 use tracing::{error, warn};
 
 // Keys of interest we expect to find in the JSON output generated
@@ -237,139 +245,211 @@ const VOLUME_HANDLE: &str = "volumeHandle";
 const METADATA_FILE: &str = "vol_data.json";
 const DEVICE_PATTERN: &str = "nvme";
 
-/// This filter is to be used specifically search for mountpoints in context of k8s
-///
-/// # Fields
-/// * `driver` - Name of the csi driver which provisioned the volume.
-/// * `volume_id` - Name of the volume which is being searched for.
-/// * `file_name` - Name of the file where kubelet stores the metadata.
-/// * `device_pattern` - Pattern to search for a specific type of device, ex nvme.
-#[derive(Debug)]
-struct FilterCsiMounts<'a> {
-    driver: &'a str,
-    volume_id: &'a str,
-    file_name: &'a str,
-    device_pattern: &'a str,
-}
-
-/// Finds CSI mount points using `findmnt` and filters based on the given criteria.
-async fn find_csi_mount(
-    filter: FilterCsiMounts<'_>,
-    path_prefix: Option<&str>,
-) -> Result<Vec<HashMap<String, String>>, DeviceError> {
-    let mut command = tokio::process::Command::new(FIND_MNT);
-    command.args(FIND_MNT_ARGS);
-
-    if let Some(path_prefix) = path_prefix {
-        command.args(["-R", path_prefix]);
+fn block_device_name<'a>(fstype: &str, root: &'a str, allow_deleted: bool) -> Option<&'a str> {
+    if !matches!(fstype, "devtmpfs" | "tmpfs") {
+        return None;
     }
-
-    let output = command.output().await?;
-
-    if !output.status.success() {
-        return Err(DeviceError::new(String::from_utf8(output.stderr)?.as_str()));
-    }
-
-    let json_str = String::from_utf8(output.stdout)?;
-    let json: Value = serde_json::from_str(&json_str)?;
-
-    let mut results: Vec<HashMap<String, String>> = Vec::new();
-    filter_csi_findmnt(&json, &filter, &mut results);
-
-    Ok(results)
-}
-
-/// Filters JSON output from `findmnt` for matching CSI mount points as per the filter.
-fn filter_csi_findmnt(
-    json_val: &Value,
-    filter: &FilterCsiMounts,
-    results: &mut Vec<HashMap<String, String>>,
-) {
-    match json_val {
-        Value::Array(json_array) => {
-            for jsonvalue in json_array {
-                filter_csi_findmnt(jsonvalue, filter, results);
-            }
-        }
-        Value::Object(json_map) => {
-            if let Some(source_value) = json_map.get(SOURCE_KEY) {
-                let source_str = key_adjusted_value(SOURCE_KEY, source_value);
-                if source_str.contains(filter.device_pattern) {
-                    if let Some(target_value) = json_map.get(TARGET_KEY) {
-                        let target_str = target_value.as_str().unwrap_or_default();
-
-                        if let Some(parent_path) = std::path::Path::new(target_str).parent() {
-                            let vol_data_path = parent_path.join(filter.file_name);
-                            let vol_data_path_str = vol_data_path.to_string_lossy();
-
-                            if let Ok(vol_data) = read_vol_data_json(&vol_data_path_str) {
-                                if vol_data.get(DRIVER_NAME)
-                                    == Some(&Value::String(filter.driver.to_string()))
-                                    && vol_data.get(VOLUME_HANDLE)
-                                        == Some(&Value::String(filter.volume_id.to_string()))
-                                {
-                                    results.push(jsonmap_to_hashmap(json_map));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            for (_, jsonvalue) in json_map {
-                if jsonvalue.is_array() || jsonvalue.is_object() {
-                    filter_csi_findmnt(jsonvalue, filter, results);
-                }
-            }
-        }
-        _ => (),
+    let root = if allow_deleted {
+        root.strip_suffix("//deleted").unwrap_or(root)
+    } else {
+        root
     };
+    root.strip_prefix('/')
+        .filter(|name| !name.is_empty() && !name.contains('/'))
 }
 
-/// Reads and parses a file into a JSON object.
-fn read_vol_data_json(path: &str) -> Result<serde_json::Map<String, Value>, DeviceError> {
-    let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
-    let json: serde_json::Map<String, Value> = serde_json::from_reader(reader)?;
-    Ok(json)
+pub(crate) enum MountQuery {
+    Device(String),
+    Csi { volume_id: String, kubelet: PathBuf },
 }
 
-/// Retrieves mount paths for a given CSI volume ID by parsing the metadata file.
-pub(crate) async fn get_csi_mountpaths(
-    volume_id: &str,
-    path_prefix: Option<&str>,
+/// Read a consistent snapshot, as in devinfo's workaround for older kernels.
+pub(crate) async fn force_unstage_mountpaths(
+    query: MountQuery,
 ) -> Result<Vec<DeviceMount>, DeviceError> {
-    let filter = FilterCsiMounts {
-        driver: &csi_plugin_name(),
-        volume_id,
-        file_name: METADATA_FILE,
-        device_pattern: DEVICE_PATTERN,
-    };
-    match find_csi_mount(filter, path_prefix).await {
-        Ok(results) => {
-            let mut mountpaths: Vec<DeviceMount> = Vec::new();
-            for entry in results {
-                if let Some(mountpath) = entry.get(TARGET_KEY) {
-                    if let Some(fstype) = entry.get(FSTYPE_KEY) {
-                        mountpaths.push(DeviceMount::new(
-                            mountpath.to_string(),
-                            Fs::from_str(fstype)
-                                .unwrap_or(Fs::Unsupported(fstype.to_string()))
-                                .into(),
-                        ))
-                    } else {
-                        warn!(volume.id=%volume_id, "Missing fstype for {mountpath}");
-                        mountpaths.push(DeviceMount::new(
-                            mountpath.to_string(),
-                            Fs::Unsupported("".to_string()).into(),
-                        ))
-                    }
-                } else {
-                    warn!(volume.id=%volume_id, ?entry, "Missing target field");
-                }
+    super::runtime::spawn_blocking(move || {
+        const MOUNTINFO: &str = "/proc/self/mountinfo";
+        let mut previous = std::fs::read_to_string(MOUNTINFO)?;
+        for _ in 0..=10 {
+            let current = std::fs::read_to_string(MOUNTINFO)?;
+            if previous == current {
+                return scan_mounts(&current, query);
             }
-            Ok(mountpaths)
+            previous = current;
         }
-        Err(e) => Err(e),
+        Err(DeviceError::new(
+            "Could not obtain a consistent mountinfo snapshot",
+        ))
+    })
+    .await
+    .map_err(|err| DeviceError::new(err.to_string()))?
+}
+
+// procfs-core exposes the kernel-escaped strings in its mountinfo records.
+fn decode_mountinfo_path(path: &str) -> Result<Cow<'_, str>, DeviceError> {
+    let Some((start, escaped)) = path.split_once('\\') else {
+        return Ok(Cow::Borrowed(path));
+    };
+
+    let invalid = || DeviceError::new(format!("Invalid mountinfo path: {path}"));
+    let mut decoded = Vec::with_capacity(path.len());
+    decoded.extend_from_slice(start.as_bytes());
+    for part in escaped.split('\\') {
+        let byte = match part.as_bytes() {
+            [a @ b'0'..=b'3', b @ b'0'..=b'7', c @ b'0'..=b'7', ..] => {
+                (a - b'0') * 64 + (b - b'0') * 8 + (c - b'0')
+            }
+            _ => return Err(invalid()),
+        };
+        decoded.push(byte);
+        decoded.extend_from_slice(&part.as_bytes()[3..]);
+    }
+    String::from_utf8(decoded)
+        .map(Cow::Owned)
+        .map_err(|_| invalid())
+}
+
+fn scan_mounts(mounts: &str, mut query: MountQuery) -> Result<Vec<DeviceMount>, DeviceError> {
+    if let MountQuery::Csi { kubelet, .. } = &mut query {
+        *kubelet = kubelet.canonicalize()?;
+    }
+    let driver = csi_plugin_name();
+    let mut paths = Vec::new();
+    for line in mounts.lines() {
+        let mount = procfs_core::process::MountInfo::from_line(line)
+            .map_err(|error| DeviceError::new(error.to_string()))?;
+        let target =
+            decode_mountinfo_path(mount.mount_point.to_str().expect("parsed from a string"))?;
+        let target = Path::new(target.as_ref());
+        let root = decode_mountinfo_path(&mount.root)?;
+        let source = decode_mountinfo_path(mount.mount_source.as_deref().unwrap_or_default())?;
+        let block = block_device_name(
+            &mount.fs_type,
+            &root,
+            matches!(query, MountQuery::Csi { .. }),
+        );
+        let matches = match &query {
+            MountQuery::Device(device) => {
+                source == device.as_str()
+                    || block.is_some_and(|name| device.strip_prefix("/dev/") == Some(name))
+            }
+            MountQuery::Csi { volume_id, kubelet } => {
+                block.unwrap_or(&source).contains(DEVICE_PATTERN)
+                    && target.starts_with(kubelet)
+                    && csi_mount_metadata_path(target, kubelet, block.is_some())
+                        .is_some_and(|path| csi_volume_matches(&path, &driver, volume_id))
+            }
+        };
+        if matches
+            && (block.is_none()
+                || std::fs::symlink_metadata(target)?
+                    .file_type()
+                    .is_block_device())
+        {
+            let fstype = Fs::from_str(&mount.fs_type).unwrap_or(Fs::Unsupported(mount.fs_type));
+            paths.push(DeviceMount::new(
+                target.to_string_lossy().into_owned(),
+                fstype.into(),
+            ));
+        }
+    }
+    Ok(paths)
+}
+
+fn csi_mount_metadata_path(target: &Path, kubelet_path: &Path, block: bool) -> Option<PathBuf> {
+    if block {
+        let devices = kubelet_path.join("plugins/kubernetes.io/csi/volumeDevices");
+        if let Ok(relative) = target.strip_prefix(&devices) {
+            let parts: Vec<_> = relative.iter().collect();
+            let volume = match parts.as_slice() {
+                [publish, volume, _] if *publish == "publish" => volume,
+                [volume, dev, _] if *dev == "dev" => volume,
+                _ => return None,
+            };
+            return Some(devices.join(volume).join("data").join(METADATA_FILE));
+        }
+    }
+    target.parent().map(|parent| parent.join(METADATA_FILE))
+}
+
+fn csi_volume_matches(path: &Path, driver: &str, volume_id: &str) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let reader = std::io::BufReader::new(file);
+    let Ok(data) = serde_json::from_reader::<_, Value>(reader) else {
+        return false;
+    };
+    data.get(DRIVER_NAME).and_then(Value::as_str) == Some(driver)
+        && data.get(VOLUME_HANDLE).and_then(Value::as_str) == Some(volume_id)
+}
+
+#[cfg(test)]
+mod mountinfo_tests {
+    use super::*;
+
+    #[test]
+    fn scans_valid_mounts_and_propagates_parse_errors() {
+        let mounts = concat!(
+            "1 0 0:1 / /empty rw - tmpfs  rw\n",
+            r"2 0 0:2 / /hash rw - tmpfs source\043name rw",
+            "\n",
+            "3 0 0:3 /nvme0n1//deleted /old rw - devtmpfs udev rw\n",
+            r"4 0 259:0 / /live\043mount rw - ext4 /dev/nvme0n1 rw",
+        );
+        let device = || MountQuery::Device("/dev/nvme0n1".into());
+        let paths = scan_mounts(mounts, device()).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].mount_path(), "/live#mount");
+        assert_eq!(
+            block_device_name("devtmpfs", "/nvme0n1//deleted", true),
+            Some("nvme0n1")
+        );
+        assert!(scan_mounts(&format!("{mounts}\ninvalid mountinfo"), device()).is_err());
+    }
+
+    #[test]
+    fn finds_csi_metadata_through_symlinked_kubelet_root() -> std::io::Result<()> {
+        let root = std::env::temp_dir().join(format!("mountinfo-{}", uuid::Uuid::new_v4()));
+        let kubelet = root.join("kubelet");
+        let mount_parent = kubelet.join("volume");
+        std::fs::create_dir_all(&mount_parent)?;
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&kubelet, &link)?;
+        std::fs::write(
+            mount_parent.join(METADATA_FILE),
+            serde_json::json!({"driverName": csi_plugin_name(), "volumeHandle": "volume"})
+                .to_string(),
+        )?;
+        let target = mount_parent.canonicalize()?.join("mount");
+        let mounts = format!(
+            "71 30 259:0 / {} rw - ext4 /dev/nvme0n1 rw",
+            target.display()
+        );
+        let query = |id: &str| MountQuery::Csi {
+            volume_id: id.into(),
+            kubelet: link.clone(),
+        };
+        let paths = scan_mounts(&mounts, query("volume")).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(Path::new(&paths[0].mount_path()), target);
+        assert!(scan_mounts(&mounts, query("other-volume"))
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn locates_raw_block_metadata_for_both_kubelet_mounts() {
+        let kubelet = Path::new("/var/lib/kubelet");
+        let devices = kubelet.join("plugins/kubernetes.io/csi/volumeDevices");
+        let expected = devices.join("pvc-volume/data/vol_data.json");
+        for target in ["publish/pvc-volume/pod", "pvc-volume/dev/pod"] {
+            assert_eq!(
+                csi_mount_metadata_path(&devices.join(target), kubelet, true).unwrap(),
+                expected
+            );
+        }
     }
 }

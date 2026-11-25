@@ -107,7 +107,10 @@ impl NodePlugin for NodePluginSvc {
                 })?;
 
                 if let Ok(Some(device)) = Device::lookup(&uuid).await {
-                    let mountpaths = findmnt::get_mountpaths(&device.devname()).await?;
+                    let mountpaths = findmnt::force_unstage_mountpaths(
+                        findmnt::MountQuery::Device(device.devname()),
+                    )
+                    .await?;
                     debug!(
                         "Device: {} found, with mount paths: {}, issuing unmount",
                         device.devname(),
@@ -119,8 +122,11 @@ impl NodePlugin for NodePluginSvc {
                     );
                     lazy_unmount_mountpaths(&mountpaths).await?;
                 } else {
-                    let mountpaths =
-                        findmnt::get_csi_mountpaths(&volume_id, Some(&self.kubelet_path)).await?;
+                    let mountpaths = findmnt::force_unstage_mountpaths(findmnt::MountQuery::Csi {
+                        volume_id,
+                        kubelet: self.kubelet_path.clone().into(),
+                    })
+                    .await?;
                     debug!(
                         "Device was not found, detected mount paths: {}, issuing unmount",
                         mountpaths

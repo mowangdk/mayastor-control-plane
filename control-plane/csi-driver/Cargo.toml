@@ -57,6 +57,7 @@ parse-size = { workspace = true }
 percent-encoding = { workspace = true }
 
 [target.'cfg(target_os="linux")'.dependencies]
+procfs-core = { version = "0.18", default-features = false }
 udev = { workspace = true }
 devinfo = { workspace = true }
 sys-mount = { workspace = true, default-features = false }
