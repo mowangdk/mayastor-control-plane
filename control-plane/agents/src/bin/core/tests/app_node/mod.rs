@@ -5,6 +5,46 @@ use stor_port::types::v0::{
     transport::{DeregisterAppNode, Filter, RegisterAppNode},
 };
 
+#[tokio::test]
+async fn failed_registration_keeps_last_persisted_endpoint() {
+    let cluster = ClusterBuilder::builder()
+        .with_rest(false)
+        .with_io_engines(0)
+        .with_store_timeout(std::time::Duration::from_secs(1))
+        .build()
+        .await
+        .unwrap();
+    let client = cluster.grpc_client().app_node();
+    let original = RegisterAppNode::new(
+        "csi-node-1".into(),
+        "10.0.0.1:50052".parse().unwrap(),
+        None,
+        None,
+    );
+    let updated = RegisterAppNode {
+        endpoint: "10.0.0.2:50052".parse().unwrap(),
+        ..original.clone()
+    };
+    let filter = Filter::AppNode(original.id.clone());
+    client.register_app_node(&original, None).await.unwrap();
+
+    cluster.composer().pause("etcd").await.unwrap();
+    let failed = client.register_app_node(&updated, None).await;
+    cluster.composer().thaw("etcd").await.unwrap();
+    assert!(
+        failed.is_err(),
+        "registration succeeded while etcd was paused"
+    );
+    let node = client.get(filter.clone(), None).await.unwrap();
+    assert_eq!(node.spec.endpoint, original.endpoint);
+
+    client.register_app_node(&updated, None).await.unwrap();
+    cluster.restart_core().await;
+    cluster.node_service_liveness(None).await.unwrap();
+    let node = client.get(filter, None).await.unwrap();
+    assert_eq!(node.spec.endpoint, updated.endpoint);
+}
+
 /// Test for registration, listing, retrieval, and deregistration of app nodes in a cluster.
 ///
 /// Creates a new cluster and registers two app nodes.
